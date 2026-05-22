@@ -188,7 +188,7 @@ class SparseEncoder(nn.Module):
 
         N, C, D, H, W = spatial_features.shape
         spatial_features = spatial_features.view(N, C * D, H, W)
-        import pdb; pdb.set_trace()
+        
         spatial_features = self.conv_out(spatial_features)
 
         if self.return_middle_feats:

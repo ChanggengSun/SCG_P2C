@@ -1,5 +1,7 @@
+import copy
 import numpy as np
 import torch
+from torch.nn.modules.batchnorm import _BatchNorm
 
 from datasets import points_utils
 from datasets.metrics import estimateOverlap, estimateAccuracy
@@ -16,24 +18,37 @@ class P2PJointSeq5Voxel(BaseModel):
         self,
         backbone=None,
         fuser=None,
+        tracking_fuser=None,
+        flow_fuser=None,
         tracking_head=None,
         flow_head=None,
         flow_loss=None,
         joint_pair_mode='seq5_pair123_flow_pair4',
         flow_freeze_shared_backbone=False,
         flow_backbone_lr_mult=1.0,
+        freeze_flow_branch=False,
         cfg=None,
     ):
         super().__init__()
         self.config = cfg
         self.backbone = MODELS.build(backbone)
-        self.fuse = MODELS.build(fuser)
+
+        # Keep ``self.fuse`` as the tracking fuser name for compatibility with
+        # original P2P checkpoints/configs. Flow owns a separate fuser so the
+        # two task branches only share the backbone.
+        tracking_fuser = tracking_fuser if tracking_fuser is not None else fuser
+        flow_fuser = flow_fuser if flow_fuser is not None else copy.deepcopy(fuser)
+        if tracking_fuser is None or flow_fuser is None:
+            raise ValueError('P2PJointSeq5Voxel requires tracking_fuser/fuser and flow_fuser.')
+        self.fuse = MODELS.build(tracking_fuser)
+        self.flow_fuse = MODELS.build(flow_fuser)
         self.tracking_head = MODELS.build(tracking_head)
         self.flow_head = MODELS.build(flow_head)
         self.flow_loss = MODELS.build(flow_loss)
         self.joint_pair_mode = str(joint_pair_mode)
         self.flow_freeze_shared_backbone = bool(flow_freeze_shared_backbone)
         self.flow_backbone_lr_mult = float(flow_backbone_lr_mult)
+        self.freeze_flow_branch = bool(freeze_flow_branch)
 
         if self.joint_pair_mode == 'pc0_pc1':
             self._flow_pair_keys = [('pc0', 'pc1')]
@@ -53,6 +68,44 @@ class P2PJointSeq5Voxel(BaseModel):
         self._shared_lr_group_indices = None
         self._shared_lr_flow_base = None
         self._shared_lr_mixed_groups = False
+
+        if self.freeze_flow_branch:
+            self._freeze_flow_parameters()
+
+    def _freeze_flow_parameters(self):
+        for p in self.flow_fuse.parameters():
+            p.requires_grad = False
+        for p in self.flow_head.parameters():
+            p.requires_grad = False
+        for p in self.flow_loss.parameters():
+            p.requires_grad = False
+
+    @staticmethod
+    def _expand_legacy_fuse_state_dict(state_dict):
+        """Map legacy shared ``fuse.*`` weights to the new ``flow_fuse.*``.
+
+        Older joint checkpoints had a single shared fuser saved as ``fuse.*``.
+        The current model keeps ``fuse.*`` for tracking and adds
+        ``flow_fuse.*`` for flow. Duplicating those legacy tensors lets old
+        flow checkpoints initialize both branch-specific fusers.
+        """
+        if not isinstance(state_dict, dict):
+            return state_dict
+        if any(k.startswith('flow_fuse.') for k in state_dict.keys()):
+            return state_dict
+
+        expanded = dict(state_dict)
+        for k, v in state_dict.items():
+            if k.startswith('fuse.'):
+                expanded.setdefault('flow_fuse.' + k[len('fuse.'):], v)
+        return expanded
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = self._expand_legacy_fuse_state_dict(state_dict)
+        try:
+            return super().load_state_dict(state_dict, strict=strict, assign=assign)
+        except TypeError:
+            return super().load_state_dict(state_dict, strict=strict)
 
     @staticmethod
     def _ensure_list(data):
@@ -126,8 +179,9 @@ class P2PJointSeq5Voxel(BaseModel):
     def _iter_shared_parameters(self):
         for p in self.backbone.parameters():
             yield p
-        for p in self.fuse.parameters():
-            yield p
+
+    def _iter_shared_modules(self):
+        yield self.backbone
 
     def _freeze_shared_backbone(self):
         state = []
@@ -140,6 +194,25 @@ class P2PJointSeq5Voxel(BaseModel):
     def _restore_shared_backbone(state):
         for p, req in state:
             p.requires_grad = req
+
+    def _freeze_shared_bn_stats(self):
+        """Freeze BN running stats in shared modules during tracking stage.
+
+        Only the backbone is shared between tracking and flow. Branch fusers
+        keep their own parameters and BN statistics.
+        """
+        state = []
+        for shared_module in self._iter_shared_modules():
+            for module in shared_module.modules():
+                if isinstance(module, _BatchNorm):
+                    state.append((module, bool(module.training)))
+                    module.eval()
+        return state
+
+    @staticmethod
+    def _restore_shared_bn_stats(state):
+        for module, was_training in state:
+            module.train(was_training)
 
     def _init_shared_lr_groups(self, optim_wrapper):
         if self._shared_lr_group_indices is not None and self._shared_lr_flow_base is not None:
@@ -220,13 +293,19 @@ class P2PJointSeq5Voxel(BaseModel):
 
         raise RuntimeError(f'Cannot normalize tracking field with len={len(outer)}.')
 
-    def _shared_pair_feats(self, prev_points, this_points):
+    def _pair_feats_with_fuser(self, prev_points, this_points, fuser):
         prev_points = self._as_pointcloud_list(prev_points)
         this_points = self._as_pointcloud_list(this_points)
         stack_points = prev_points + this_points
         stack_feats = self.backbone(stack_points)
-        cat_feats = self.fuse(stack_feats)
+        cat_feats = fuser(stack_feats)
         return cat_feats
+
+    def _tracking_pair_feats(self, prev_points, this_points):
+        return self._pair_feats_with_fuser(prev_points, this_points, self.fuse)
+
+    def _flow_pair_feats(self, prev_points, this_points):
+        return self._pair_feats_with_fuser(prev_points, this_points, self.flow_fuse)
 
     def _tracking_head_forward(self, feats, wlh):
         if self.config.box_aware:
@@ -315,7 +394,7 @@ class P2PJointSeq5Voxel(BaseModel):
             fallback = track_context[0]['prev_points'][0]
             return fallback.sum() * 0.0, {}, 0
 
-        feats = self._shared_pair_feats(batch_prev_points, batch_this_points)
+        feats = self._tracking_pair_feats(batch_prev_points, batch_this_points)
         track_out = self._tracking_head_forward(feats, batch_wlh)
         loss_dict = self.tracking_head.loss(
             track_out,
@@ -350,7 +429,7 @@ class P2PJointSeq5Voxel(BaseModel):
         box_label = pair_item['box_label'][:bs]
         theta = pair_item['theta'][:bs]
 
-        feats = self._shared_pair_feats(prev_points, this_points)
+        feats = self._tracking_pair_feats(prev_points, this_points)
         track_out = self._tracking_head_forward(feats, wlh)
         loss_dict = self.tracking_head.loss(
             track_out,
@@ -391,8 +470,8 @@ class P2PJointSeq5Voxel(BaseModel):
             if bs < 1:
                 raise RuntimeError(f'No flow points for pair ({prev_key},{this_key})')
             # Batch-mode flow feature extraction:
-            # run shared backbone/fuser once per temporal pair instead of once per sample.
-            pair_feats.append(self._shared_pair_feats(prev_list[:bs], this_list[:bs]))
+            # run shared backbone + flow-specific fuser once per temporal pair.
+            pair_feats.append(self._flow_pair_feats(prev_list[:bs], this_list[:bs]))
 
         return pair_feats
 
@@ -615,6 +694,13 @@ class P2PJointSeq5Voxel(BaseModel):
         return torch.tensor(0.0, dtype=torch.float32)
 
     def train_step_flow(self, data, optim_wrapper):
+        if self.freeze_flow_branch:
+            zero = torch.tensor(0.0, dtype=torch.float32, device=next(self.parameters()).device)
+            return {
+                'flow_loss': zero,
+                'stage_updates': zero.new_tensor(0.0),
+            }
+
         with optim_wrapper.optim_context(self):
             data = self.data_preprocessor(data, True)
             data = self._ensure_sample_dict(data)
@@ -640,6 +726,7 @@ class P2PJointSeq5Voxel(BaseModel):
 
     def train_step_track(self, data, optim_wrapper):
         freeze_state = self._freeze_shared_backbone()
+        bn_state = self._freeze_shared_bn_stats()
         try:
             with optim_wrapper.optim_context(self):
                 data = self.data_preprocessor(data, True)
@@ -655,6 +742,7 @@ class P2PJointSeq5Voxel(BaseModel):
             self._backward_step_once(pair_total, optim_wrapper)
         finally:
             self._restore_shared_backbone(freeze_state)
+            self._restore_shared_bn_stats(bn_state)
 
         pair_detached = pair_total.detach()
         log_vars = {
@@ -704,10 +792,16 @@ class P2PJointSeq5Voxel(BaseModel):
 
             # Stage 2: tracking(pc0->pc1)
             self._set_shared_lr_stage(optim_wrapper, stage='tracking')
-            with optim_wrapper.optim_context(self):
-                pair_total, pair_loss_dict = self._compute_single_pair_tracking_loss(
-                    track_context, self._tracking_pair_index)
-            self._backward_step_once(pair_total, optim_wrapper)
+            freeze_state = self._freeze_shared_backbone()
+            bn_state = self._freeze_shared_bn_stats()
+            try:
+                with optim_wrapper.optim_context(self):
+                    pair_total, pair_loss_dict = self._compute_single_pair_tracking_loss(
+                        track_context, self._tracking_pair_index)
+                self._backward_step_once(pair_total, optim_wrapper)
+            finally:
+                self._restore_shared_backbone(freeze_state)
+                self._restore_shared_bn_stats(bn_state)
             tracking_loss = pair_total.detach()
 
             log_vars['track_pair_loss'] = tracking_loss
@@ -732,9 +826,16 @@ class P2PJointSeq5Voxel(BaseModel):
         track_context = self._build_tracking_context(inputs, data_samples)
 
         for pair_idx in [0, 1, 2]:
-            with optim_wrapper.optim_context(self):
-                pair_total, pair_loss_dict = self._compute_single_pair_tracking_loss(track_context, pair_idx)
-            self._backward_step_once(pair_total, optim_wrapper)
+            self._set_shared_lr_stage(optim_wrapper, stage='tracking')
+            freeze_state = self._freeze_shared_backbone()
+            bn_state = self._freeze_shared_bn_stats()
+            try:
+                with optim_wrapper.optim_context(self):
+                    pair_total, pair_loss_dict = self._compute_single_pair_tracking_loss(track_context, pair_idx)
+                self._backward_step_once(pair_total, optim_wrapper)
+            finally:
+                self._restore_shared_backbone(freeze_state)
+                self._restore_shared_bn_stats(bn_state)
 
             pair_losses.append(pair_total.detach())
             log_vars[f'track_pair{pair_idx + 1}_loss'] = pair_total.detach()
@@ -754,9 +855,16 @@ class P2PJointSeq5Voxel(BaseModel):
             flow_loss = pair_losses[0] * 0.0
         log_vars['flow_loss'] = flow_loss.detach()
 
-        with optim_wrapper.optim_context(self):
-            pair4_total, pair4_loss_dict = self._compute_single_pair_tracking_loss(track_context, 3)
-        self._backward_step_once(pair4_total, optim_wrapper)
+        self._set_shared_lr_stage(optim_wrapper, stage='tracking')
+        freeze_state = self._freeze_shared_backbone()
+        bn_state = self._freeze_shared_bn_stats()
+        try:
+            with optim_wrapper.optim_context(self):
+                pair4_total, pair4_loss_dict = self._compute_single_pair_tracking_loss(track_context, 3)
+            self._backward_step_once(pair4_total, optim_wrapper)
+        finally:
+            self._restore_shared_backbone(freeze_state)
+            self._restore_shared_bn_stats(bn_state)
         pair_losses.append(pair4_total.detach())
         log_vars['track_pair4_loss'] = pair4_total.detach()
         for k, v in pair4_loss_dict.items():
@@ -778,7 +886,7 @@ class P2PJointSeq5Voxel(BaseModel):
         return log_vars
 
     def _single_pair_inference(self, pair_input):
-        feats = self._shared_pair_feats(pair_input['prev_points'][0], pair_input['this_points'][0])
+        feats = self._tracking_pair_feats(pair_input['prev_points'][0], pair_input['this_points'][0])
         wlh = pair_input['wlh']
         out = self._tracking_head_forward(feats, wlh)
         coors = out['coors'][0]
