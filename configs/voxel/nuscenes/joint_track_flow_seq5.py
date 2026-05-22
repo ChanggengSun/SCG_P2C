@@ -31,7 +31,9 @@ model = dict(
         voxel_size=[0.075, 0.075, 0.15],
         grid_size=[27, 128, 128],
         output_channels=128),
-    fuser=dict(type='BEVFuser'),
+    # Branch-specific fusers: only the backbone is shared between tasks.
+    tracking_fuser=dict(type='BEVFuser'),
+    flow_fuser=dict(type='BEVFuser'),
     tracking_head=dict(
         type='VoxelHead',
         q_distribution='laplace',
@@ -64,7 +66,7 @@ train_dataset = dict(
     require_deltaflow_fields=False,
     track_data_dir=raw_data_dir,
     track_version='v1.0-trainval',
-    track_source='raw',
+    track_source='h5',
     track_cfg=dict(
         target_thr=None,
         search_thr=5,
@@ -88,6 +90,8 @@ val_dataset = dict(
     dataset=dict(
         type='NuScenesDataset',
         path=raw_data_dir,
+        point_source='h5',
+        h5_data_dir=flow_h5_dir,
         split='val',
         category_name=category_name,
         preloading=True,
@@ -119,5 +123,4 @@ train_cfg = dict(
 
 val_cfg = dict()
 test_cfg = None
-
 

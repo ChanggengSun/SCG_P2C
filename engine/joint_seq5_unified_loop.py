@@ -62,6 +62,7 @@ class JointSeq5UnifiedTrainLoop(BaseLoop):
         dataloader: Union[DataLoader, Dict],
         max_epochs: int,
         track_start_epoch: int = 11,
+        enable_flow_stage: bool = True,
         val_begin: int = 1,
         val_interval: int = 1,
         dynamic_intervals: Optional[List[Tuple[int, int]]] = None,
@@ -76,6 +77,7 @@ class JointSeq5UnifiedTrainLoop(BaseLoop):
         self._iter = 0
 
         self.track_start_epoch = max(1, int(track_start_epoch))
+        self.enable_flow_stage = bool(enable_flow_stage)
         self.val_begin = max(1, int(val_begin))
         self.val_interval = max(1, int(val_interval))
         self.stop_training = False
@@ -185,9 +187,11 @@ class JointSeq5UnifiedTrainLoop(BaseLoop):
         self.runner.call_hook(
             'before_train_iter', batch_idx=idx, data_batch=data_batch)
 
-        # Stage 1: flow
-        flow_outputs = self.runner.model.train_step_flow(
-            data_batch, optim_wrapper=self.runner.optim_wrapper)
+        # Stage 1: flow (optional)
+        flow_outputs = None
+        if self.enable_flow_stage:
+            flow_outputs = self.runner.model.train_step_flow(
+                data_batch, optim_wrapper=self.runner.optim_wrapper)
 
         # Stage 2: tracking (same batch, no extra I/O)
         track_outputs = None
@@ -208,7 +212,7 @@ class JointSeq5UnifiedTrainLoop(BaseLoop):
                 ref_tensor = torch.tensor(0.0)
             bs = float(len(self._as_batch_list(data_batch)))
             outputs['batch_size'] = ref_tensor.new_tensor(bs)
-            outputs['flow_batch_size'] = ref_tensor.new_tensor(bs)
+            outputs['flow_batch_size'] = ref_tensor.new_tensor(bs if self.enable_flow_stage else 0.0)
             outputs['track_batch_size'] = ref_tensor.new_tensor(
                 bs if run_track else 0.0)
 

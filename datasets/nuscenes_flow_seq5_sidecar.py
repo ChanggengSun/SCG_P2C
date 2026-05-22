@@ -1,5 +1,5 @@
-import pickle
 from pathlib import Path
+import pickle
 
 import h5py
 import numpy as np
@@ -26,6 +26,8 @@ class NuScenesFlowSeq5SidecarDataset(Dataset):
         require_deltaflow_fields=False,
         pair_mode='seq5',
         preloading=False,
+        sample_ratio=1.0,
+        sample_seed=0,
         **kwargs,
     ):
         self.path = str(path)
@@ -38,6 +40,10 @@ class NuScenesFlowSeq5SidecarDataset(Dataset):
         self.require_deltaflow_fields = bool(require_deltaflow_fields)
         self.pair_mode = str(pair_mode).strip().lower()
         self.preloading = bool(preloading)
+        self.sample_ratio = float(sample_ratio)
+        self.sample_seed = int(sample_seed)
+        if not (0.0 < self.sample_ratio <= 1.0):
+            raise ValueError(f'sample_ratio must be in (0, 1], got {self.sample_ratio}')
 
         if self.pair_mode == 'pc0_pc1':
             self.frame_keys = ['pc0', 'pc1']
@@ -54,6 +60,17 @@ class NuScenesFlowSeq5SidecarDataset(Dataset):
 
         with open(self.sidecar_path, 'rb') as f:
             self.samples = pickle.load(f)
+
+        orig_count = len(self.samples)
+        if self.sample_ratio < 1.0 and orig_count > 0:
+            keep_count = max(1, int(round(orig_count * self.sample_ratio)))
+            rng = np.random.RandomState(self.sample_seed)
+            keep_indices = np.sort(rng.choice(orig_count, size=keep_count, replace=False))
+            self.samples = [self.samples[int(i)] for i in keep_indices]
+            print(
+                f'[NuScenesFlowSeq5SidecarDataset] sample_ratio={self.sample_ratio:.4f}, '
+                f'kept {len(self.samples)}/{orig_count} samples (seed={self.sample_seed}).'
+            )
 
         if len(self.samples) == 0:
             raise RuntimeError(f'No seq5 samples in sidecar: {self.sidecar_path}')

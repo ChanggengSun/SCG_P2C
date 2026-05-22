@@ -37,6 +37,8 @@ class NuScenesJointSeq5Dataset(Dataset):
         skip_flow_loading=False,
         pair_mode='seq5',
         preloading=False,
+        sample_ratio=1.0,
+        sample_seed=0,
         **kwargs,
     ):
         self.path = str(path)
@@ -48,6 +50,10 @@ class NuScenesJointSeq5Dataset(Dataset):
         self.num_candidates = max(1, int(num_candidates))
         self.require_deltaflow_fields = bool(require_deltaflow_fields)
         self.preloading = bool(preloading)
+        self.sample_ratio = float(sample_ratio)
+        self.sample_seed = int(sample_seed)
+        if not (0.0 < self.sample_ratio <= 1.0):
+            raise ValueError(f'sample_ratio must be in (0, 1], got {self.sample_ratio}')
 
         self.pair_mode = str(pair_mode).strip().lower()
         if self.pair_mode == 'pc0_pc1':
@@ -79,6 +85,17 @@ class NuScenesJointSeq5Dataset(Dataset):
 
         with open(self.sidecar_path, 'rb') as f:
             self.samples = pickle.load(f)
+
+        orig_count = len(self.samples)
+        if self.sample_ratio < 1.0 and orig_count > 0:
+            keep_count = max(1, int(round(orig_count * self.sample_ratio)))
+            rng = np.random.RandomState(self.sample_seed)
+            keep_indices = np.sort(rng.choice(orig_count, size=keep_count, replace=False))
+            self.samples = [self.samples[int(i)] for i in keep_indices]
+            print(
+                f'[NuScenesJointSeq5Dataset] sample_ratio={self.sample_ratio:.4f}, '
+                f'kept {len(self.samples)}/{orig_count} samples (seed={self.sample_seed}).'
+            )
 
         if len(self.samples) == 0:
             raise RuntimeError(f'No seq5 samples in sidecar: {self.sidecar_path}')
@@ -202,13 +219,26 @@ class NuScenesJointSeq5Dataset(Dataset):
             fallback_cfg.search_thr = None
             return TrainSampler.processing(pair_data, fallback_cfg)
 
-    def _build_tracking_points(self, box_map, flow_points):
+    def _build_tracking_points(self, box_map, flow_points, ts_map=None, h5_path=None):
         track_points = {}
         if self.track_source == 'h5':
-            for key in self.frame_keys:
-                if key not in flow_points:
-                    raise KeyError(f'{key} missing in flow_points for track_source=h5')
-                track_points[key] = flow_points[key].copy()
+            # Normal joint mode: reuse already loaded flow point clouds.
+            if all(k in flow_points for k in self.frame_keys):
+                for key in self.frame_keys:
+                    track_points[key] = flow_points[key].copy()
+                return track_points
+
+            # Tracking-only mode: load tracking points directly from h5
+            # without loading/storing flow supervision fields.
+            if h5_path is None or ts_map is None:
+                raise KeyError('h5_path/ts_map are required for track_source=h5 when flow_points are unavailable.')
+            h5_path = Path(h5_path)
+            if not h5_path.exists():
+                raise FileNotFoundError(f'H5 file not found: {h5_path}')
+            with h5py.File(h5_path, 'r') as f:
+                for key in self.frame_keys:
+                    pc, _, _ = self._load_frame_from_h5(f, ts_map[key])
+                    track_points[key] = pc.copy()
             return track_points
 
         for key in self.frame_keys:
@@ -279,19 +309,25 @@ class NuScenesJointSeq5Dataset(Dataset):
             frame_poses = {k: self._identity_pose() for k in self.frame_keys}
             frame_gm = {k: None for k in self.frame_keys}
 
-        track_points = self._build_tracking_points(box_map, flow_points if flow_available else {})
+        track_points = self._build_tracking_points(
+            box_map,
+            flow_points if flow_available else {},
+            ts_map=ts_map,
+            h5_path=h5_path,
+        )
         for key in self.frame_keys:
             track_points[key] = self._fit_input_dim(track_points[key])
             track_points[key] = self._ensure_min_points(track_points[key], self.input_dim)
 
         if not flow_available:
-            flow_points = {k: track_points[k].copy() for k in self.frame_keys}
-            n0 = flow_points['pc0'].shape[0]
-            gt_flow = np.zeros((n0, 3), dtype=np.float32)
-            flow_valid = np.zeros((n0,), dtype=bool)
-            flow_category = np.zeros((n0,), dtype=np.int64)
-            flow_instance = np.zeros((n0,), dtype=np.int64)
-            pose_flow = np.zeros((n0, 3), dtype=np.float32)
+            # Tracking-only mode: keep tiny flow placeholders so downstream
+            # fields remain compatible while avoiding large duplicated caches.
+            flow_points = {}
+            gt_flow = np.zeros((1, 3), dtype=np.float32)
+            flow_valid = np.zeros((1,), dtype=bool)
+            flow_category = np.zeros((1,), dtype=np.int64)
+            flow_instance = np.zeros((1,), dtype=np.int64)
+            pose_flow = np.zeros((1, 3), dtype=np.float32)
         else:
             if self.remove_ground:
                 keep_mask_pc0 = ~frame_gm['pc0']
@@ -384,13 +420,16 @@ class NuScenesJointSeq5Dataset(Dataset):
             track_box_label.append(pair['data_samples']['box_label'])
             track_theta.append(pair['data_samples']['theta'])
 
+        pc0_arr = flow_points.get('pc0', np.zeros((1, self.input_dim), dtype=np.float32))
+        pc1_arr = flow_points.get('pc1', np.zeros((1, self.input_dim), dtype=np.float32))
+
         inputs = {
             'track_prev_points': [torch.as_tensor(x, dtype=torch.float32) for x in track_prev_points],
             'track_this_points': [torch.as_tensor(x, dtype=torch.float32) for x in track_this_points],
             'track_wlh': [torch.as_tensor(x, dtype=torch.float32) for x in track_wlh],
-            'pc0': torch.as_tensor(flow_points['pc0'], dtype=torch.float32),
-            'pc1': torch.as_tensor(flow_points['pc1'], dtype=torch.float32),
-            'query_points': torch.as_tensor(flow_points['pc0'][:, :3], dtype=torch.float32),
+            'pc0': torch.as_tensor(pc0_arr, dtype=torch.float32),
+            'pc1': torch.as_tensor(pc1_arr, dtype=torch.float32),
+            'query_points': torch.as_tensor(pc0_arr[:, :3], dtype=torch.float32),
             'pose_flow': torch.as_tensor(pose_flow, dtype=torch.float32),
             'pose0': torch.as_tensor(frame_poses['pc0'], dtype=torch.float32),
             'pose1': torch.as_tensor(frame_poses['pc1'], dtype=torch.float32),

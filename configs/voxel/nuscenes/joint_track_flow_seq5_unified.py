@@ -15,13 +15,13 @@ Data output is IDENTICAL to the dual-loader version:
 """
 _base_ = '../../default_runtime.py'
 
-raw_data_dir = 'C:/Users/SunChanggeng/Desktop/NuScenes_correct'
 flow_h5_dir = 'C:/develop/OpenSceneFlow/data/processed'
 category_name = 'Car'
+flow_only_mode = True
 flow_total_epochs = 30
-track_total_epochs = 20
-track_start_epoch = flow_total_epochs - track_total_epochs + 1
+track_total_epochs = 0
 epoch_num = flow_total_epochs
+track_start_epoch = epoch_num + 1
 batch_size = 128
 point_cloud_range = [-4.8, -4.8, -2.0, 4.8, 4.8, 2.0]
 box_aware = True
@@ -40,7 +40,7 @@ default_hooks = dict(
     checkpoint=dict(
         type='CheckpointHook',
         interval=1,
-        save_best='precision',
+        save_best=None,
         rule='greater'),
     sampler_seed=dict(type='DistSamplerSeedHook'))
 
@@ -59,7 +59,9 @@ model = dict(
         voxel_size=[0.075, 0.075, 0.15],
         grid_size=[27, 128, 128],
         output_channels=128),
-    fuser=dict(type='BEVFuser'),
+    # Branch-specific fusers: only the backbone is shared between tasks.
+    tracking_fuser=dict(type='BEVFuser'),
+    flow_fuser=dict(type='BEVFuser'),
     tracking_head=dict(
         type='VoxelHead',
         q_distribution='laplace',
@@ -72,7 +74,7 @@ model = dict(
         num_pairs=1),
     flow_loss=dict(type='DeFlowLoss'),
     joint_pair_mode='pc0_pc1',
-    flow_freeze_shared_backbone=True,
+    flow_freeze_shared_backbone=False,
     flow_backbone_lr_mult=1.0,
     cfg=dict(
         point_cloud_range=point_cloud_range,
@@ -82,37 +84,26 @@ model = dict(
         input_dim=4,
     ))
 
-# ---- UNIFIED dataset: one dataset produces both flow + tracking data ----
-unified_train_dataset = dict(
-    type='NuScenesJointSeq5Dataset',
+# ---- FLOW-ONLY dataset: load/preload only flow fields from h5 sidecar windows ----
+flow_train_dataset = dict(
+    type='NuScenesFlowSeq5SidecarDataset',
     path=flow_h5_dir,
     split='train',
     sidecar_file=f'joint_seq5_{category_name.lower()}.pkl',
     pair_mode='pc0_pc1',
-    preloading=False,
+    preloading=True,
+    sample_ratio=0.2,
+    sample_seed=0,
     category_name=category_name,
     remove_ground=False,
     input_dim=4,
     history_frames=3,
-    num_candidates=4,
+    num_candidates=1,
     require_deltaflow_fields=False,
-    # KEY CHANGE: read tracking point clouds from h5 (same source as flow)
-    # instead of going back to raw NuScenes .bin files via SDK
-    track_source='h5',
-    # KEY CHANGE: load flow data too (was True in old track-only config)
-    skip_flow_loading=False,
-    track_cfg=dict(
-        target_thr=None,
-        search_thr=5,
-        point_cloud_range=point_cloud_range,
-        input_dim=4,
-        regular_pc=False,
-        flip=True,
-    ),
 )
 
-unified_train_dataloader = dict(
-    dataset=unified_train_dataset,
+flow_train_dataloader = dict(
+    dataset=flow_train_dataset,
     batch_size=batch_size,
     num_workers=2,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -122,28 +113,7 @@ unified_train_dataloader = dict(
 )
 
 # Legacy alias for Runner compatibility
-train_dataloader = unified_train_dataloader
-
-val_dataset = dict(
-    type='TestSampler',
-    dataset=dict(
-        type='NuScenesDataset',
-        path=raw_data_dir,
-        split='val',
-        category_name=category_name,
-        preloading=True,
-    ),
-)
-
-val_dataloader = dict(
-    dataset=val_dataset,
-    batch_size=1,
-    num_workers=0,
-    sampler=dict(type='DefaultSampler', shuffle=False),
-    pin_memory=False,
-    persistent_workers=False,
-    collate_fn=simple_collate_fn,
-)
+train_dataloader = flow_train_dataloader
 
 optim_wrapper = dict(
     _delete_=True,
@@ -160,11 +130,11 @@ train_cfg = dict(
     _delete_=True,
     type='JointSeq5UnifiedTrainLoop',
     # Single dataloader — no separate flow/track loaders needed
-    dataloader=unified_train_dataloader,
+    dataloader=flow_train_dataloader,
     track_start_epoch=track_start_epoch,
     max_epochs=epoch_num,
-    val_begin=track_start_epoch,
+    val_begin=epoch_num + 1,
 )
 
-val_cfg = dict()
+val_cfg = None
 test_cfg = None
