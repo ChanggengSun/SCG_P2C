@@ -124,7 +124,6 @@ class TrainSampler(torch.utils.data.Dataset):
         data_dict = {
             'inputs': inputs,
             'data_samples': data_samples,
-            'task_type': 'track',
         }
 
         return data_dict
@@ -171,31 +170,3 @@ class TestSampler(torch.utils.data.Dataset):
         tracklet_annos = self.dataset.tracklet_anno_list[index]
         frame_ids = list(range(len(tracklet_annos)))
         return self.dataset.get_frames(index, frame_ids)
-
-
-@DATASETS.register_module()
-class JointTrainSampler(torch.utils.data.Dataset):
-
-    def __init__(self, track_dataset=None, flow_dataset=None, cfg=None):
-        super().__init__()
-        self.track_dataset = DATASETS.build(track_dataset)
-        self.flow_dataset = DATASETS.build(flow_dataset)
-        self.track_len = len(self.track_dataset)
-        self.flow_len = len(self.flow_dataset)
-        self.total_len = 2 * max(self.track_len, self.flow_len)
-
-    def __len__(self):
-        return self.total_len
-
-    def __getitem__(self, index):
-        source_index = index // 2
-        if index % 2 == 0:
-            data = self.track_dataset[source_index % self.track_len]
-            if 'task_type' not in data:
-                data['task_type'] = 'track'
-            return data
-
-        data = self.flow_dataset[source_index % self.flow_len]
-        if 'task_type' not in data:
-            data['task_type'] = 'flow'
-        return data
