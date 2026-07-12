@@ -1,11 +1,13 @@
 _base_ = '../../default_runtime.py'
 data_dir = 'C:/Users/SunChanggeng/Desktop/NuScenes_correct'
+h5_train_dir = 'C:/develop/OpenSceneFlow/data/processed/train'
+h5_val_dir = 'C:/develop/OpenSceneFlow/data/processed/val'
 category_name = 'Truck'
 batch_size = 256
 point_cloud_range = [-9.6, -9.6, -3.0, 9.6, 9.6, 3.0]
 box_aware = True
 use_rot = False
-# ========== 从 train.py 导入 collate 函数 ==========
+# ========== 浠?train.py 瀵煎叆 collate 鍑芥暟 ==========
 from train import simple_collate_fn
 
 
@@ -37,8 +39,9 @@ model = dict(
 train_dataset = dict(
     type='TrainSampler',
     dataset=dict(
-        type='NuScenesDataset',
+        type='NuScenesH5Dataset',
         path=data_dir,
+        h5_dir=h5_train_dir,
         split='train_track',
         category_name=category_name,
         preloading=True,
@@ -58,8 +61,9 @@ train_dataset = dict(
 test_dataset = dict(
     type='TestSampler',
     dataset=dict(
-        type='NuScenesDataset',
+        type='NuScenesH5Dataset',
         path=data_dir,
+        h5_dir=h5_val_dir,
         split='val',
         category_name=category_name,
         preloading=True
@@ -69,7 +73,7 @@ test_dataset = dict(
 train_dataloader = dict(
     dataset=train_dataset,
     batch_size=batch_size,
-    num_workers=0,
+    num_workers=2,
     # persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True))
 
@@ -90,3 +94,4 @@ test_dataloader = dict(
     sampler=dict(type='DefaultSampler', shuffle=False),
     collate_fn=simple_collate_fn,
 )
+
