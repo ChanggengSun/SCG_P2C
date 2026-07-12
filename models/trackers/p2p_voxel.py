@@ -5,21 +5,53 @@ import numpy as np
 from datasets import points_utils
 from nuscenes.utils import geometry_utils
 from mmengine.registry import MODELS
+from mmengine.logging import MMLogger
 
 
 @MODELS.register_module()
 class P2PVoxel(BaseModel):
 
+    EXPERT_NAMES = (
+        'Identity/Shared',
+        'Foreground',
+        'LocalPillarMotion',
+        'GlobalMotion',
+        'GeometryShape',
+        'TemporalChange',
+    )
+
     def __init__(self,
                  backbone=None,
                  fuser=None,
                  head=None,
+                 backbone_moe=None,
+                 moe_task='tracking',
+                 moe_log_interval=50,
+                 freeze_backbone=False,
                  cfg=None):
         super().__init__()
         self.config = cfg
         self.backbone = MODELS.build(backbone)
         self.fuse = MODELS.build(fuser)
         self.head = MODELS.build(head)
+        self.backbone_moe = MODELS.build(backbone_moe) if backbone_moe is not None else None
+        self.moe_task = str(moe_task)
+        self.moe_log_interval = int(moe_log_interval)
+        self._moe_call_count = 0
+        self.freeze_backbone = bool(freeze_backbone)
+        if self.freeze_backbone:
+            self._freeze_backbone()
+
+    def _freeze_backbone(self):
+        self.backbone.eval()
+        for param in self.backbone.parameters():
+            param.requires_grad_(False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.freeze_backbone:
+            self._freeze_backbone()
+        return self
 
     def forward(self,
                 inputs,
@@ -34,12 +66,64 @@ class P2PVoxel(BaseModel):
             raise RuntimeError(f'Invalid mode "{mode}". '
                                'Only supports loss, predict and tensor mode')
 
+    def _tensor_to_list(self, value):
+        if value is None:
+            return []
+        if torch.is_tensor(value):
+            value = value.detach().float().cpu().tolist()
+        return value
+
+    def _format_expert_values(self, values):
+        values = self._tensor_to_list(values)
+        return ', '.join(
+            f'E{i}:{name}={float(values[i]):.4f}'
+            for i, name in enumerate(self.EXPERT_NAMES)
+        )
+
+    def _log_moe_aux(self, aux, input_shape=None, stage='train'):
+        if not aux or self.moe_log_interval <= 0:
+            return
+        self._moe_call_count += 1
+        if self._moe_call_count != 1 and self._moe_call_count % self.moe_log_interval != 0:
+            return
+
+        topk_ids = self._tensor_to_list(aux.get('topk_ids'))
+        topk_scores = self._tensor_to_list(aux.get('topk_scores'))
+        selected = []
+        for expert_id, score in zip(topk_ids, topk_scores):
+            expert_id = int(expert_id)
+            selected.append(
+                f'E{expert_id}:{self.EXPERT_NAMES[expert_id]}={float(score):.4f}'
+            )
+
+        msg = (
+            f'[MoE][tracking][{stage}][call={self._moe_call_count}] '
+            f'input_shape={input_shape} top_k={getattr(self.backbone_moe, "top_k", None)} | '
+            f'all_raw_scores: {self._format_expert_values(aux.get("raw_score_mean"))} | '
+            f'selected_topk_by_raw_score: [{", ".join(selected)}] | '
+            f'selection_rate: {self._format_expert_values(aux.get("selection_rate"))} | '
+            f'final_gate_mean: {self._format_expert_values(aux.get("final_weight_mean"))}'
+        )
+        try:
+            MMLogger.get_current_instance().info(msg)
+        except Exception:
+            print(msg)
+
     def get_feats(self, inputs):
         prev_points = inputs['prev_points']
         this_points = inputs['this_points']
         stack_points = prev_points + this_points
 
         stack_feats = self.backbone(stack_points)
+        moe_aux = None
+        if self.backbone_moe is not None:
+            if self.training:
+                stack_feats, moe_aux = self.backbone_moe(
+                    stack_feats, task=self.moe_task, return_aux=True)
+                self._log_moe_aux(moe_aux, input_shape=tuple(stack_feats.shape), stage='train')
+            else:
+                stack_feats = self.backbone_moe(stack_feats, task=self.moe_task)
+
         cat_feats = self.fuse(stack_feats)
         if self.config.box_aware:
             wlh = torch.stack(inputs['wlh']) if isinstance(inputs['wlh'], list) \
@@ -48,6 +132,8 @@ class P2PVoxel(BaseModel):
         else:
             results = self.head(cat_feats)
 
+        if moe_aux is not None:
+            results['moe_aux'] = moe_aux
         return results
 
     def inference(self, inputs):
@@ -153,3 +239,5 @@ class P2PVoxel(BaseModel):
                      }
 
         return data_dict, results_bbs[-1], flag
+
+
