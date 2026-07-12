@@ -104,8 +104,6 @@ def main():
         cfg=dict()
     )
 
-    os.makedirs(os.path.join(runner.log_dir, 'vis_data'), exist_ok=True)
-
     if args.load_backbone_from is not None:
         load_backbone_only(runner.model, args.load_backbone_from)
 
